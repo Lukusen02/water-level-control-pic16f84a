@@ -1,0 +1,172 @@
+; ****************************************************************************
+; Medidor de nivel 1000-5000L con control de bomba
+; Sensores: activos en BAJO (0V cuando sumergidos)
+; LED rojos: RB0 (1000), RB1 (2000), RB2 (3000), RB3 (4000), RB5 (5000)
+; LED verde: RB4 (bomba encendida)
+; La bomba se ENCIENDE cuando el nivel ALCANZA los 1000L (RA0 pasa a 0)
+; La bomba se APAGA cuando el nivel ALCANZA los 5000L (RA4 pasa a 0)
+; Además, se fuerza apagado si RA4 está activo (nivel >= 5000L)
+; Se inicializa el estado de la bomba según el nivel actual
+; ****************************************************************************
+
+    LIST    p=16F84A
+    #include <P16F84A.INC>
+
+    __config _CP_OFF & _WDT_OFF & _PWRTE_ON & _XT_OSC
+
+; Variables en RAM
+    CBLOCK  0x20
+SENSORES        ; Estado actual de RA0..RA4
+SENSORES_OLD    ; Estado anterior (para detectar cambios)
+BOMBA_ESTADO    ; Bit0: 1 = bomba encendida
+CONTADOR        ; Para retardos
+CONTADOR2
+    ENDC
+
+    ORG     0x000
+    GOTO    INICIO
+
+; ============================================================
+; INICIO
+; ============================================================
+INICIO
+    ; Configurar puertos
+    BSF     STATUS, RP0        ; Banco 1
+    MOVLW   b'00011111'        ; RA0-RA4 como entradas
+    MOVWF   TRISA
+    MOVLW   b'00000000'        ; PORTB todo salidas
+    MOVWF   TRISB
+    BCF     STATUS, RP0        ; Banco 0
+
+    ; Leer estado inicial de sensores
+    MOVF    PORTA, W
+    ANDLW   0x1F
+    MOVWF   SENSORES
+    MOVWF   SENSORES_OLD
+
+    ; Inicializar estado de la bomba según nivel actual
+    ; Bomba encendida si RA0=0 (activo) Y RA4=1 (inactivo)
+    ; Es decir, nivel entre 1000 y 4999
+    CLRF    BOMBA_ESTADO       ; Por defecto apagada
+    ; Primero, si RA4 está activo (0), la bomba debe estar apagada (ya lo está)
+    BTFSS   SENSORES, 4        ; Si RA4=1 (inactivo) sigue, si es 0 salta a fin
+    GOTO    BOMBA_INI_FIN
+    ; RA4 inactivo, ahora verificar RA0
+    BTFSC   SENSORES, 0        ; ¿RA0=0? (si es 0, entonces salta? BTFSC salta si es 0)
+    GOTO    BOMBA_INI_FIN      ; Si RA0=1, no encender
+    ; Si llegamos aquí, RA0=0 y RA4=1 -> encender bomba
+    BSF     BOMBA_ESTADO, 0
+BOMBA_INI_FIN
+    ; No hacer nada, ya está apagada o encendida
+
+; ============================================================
+; BUCLE PRINCIPAL
+; ============================================================
+BUCLE
+    ; Leer sensores actuales
+    MOVF    PORTA, W
+    ANDLW   0x1F
+    MOVWF   SENSORES
+
+    ; --------------------------------------------------------
+    ; Actualizar LEDs de nivel (rojos)
+    ; Se encienden cuando el sensor está ACTIVO (0V)
+    ; --------------------------------------------------------
+    CLRF    PORTB              ; Apagar todos los LEDs primero
+
+    BTFSC   SENSORES, 0        ; ¿RA0 = 0? (activo)
+    BSF     PORTB, 0           ; Sí ? enciende LED rojo 1000L
+
+    BTFSC   SENSORES, 1
+    BSF     PORTB, 1           ; 2000L
+
+    BTFSC   SENSORES, 2
+    BSF     PORTB, 2           ; 3000L
+
+    BTFSC   SENSORES, 3
+    BSF     PORTB, 3           ; 4000L
+
+    BTFSC   SENSORES, 4
+    BSF     PORTB, 5           ; 5000L (LED rojo en RB5)
+
+    ; --------------------------------------------------------
+    ; Control de la bomba con detección de flancos
+    ; Encender: cuando RA0 pasa de 1 a 0 (llega a 1000L)
+    ; Apagar:   cuando RA4 pasa de 1 a 0 (llega a 5000L)
+    ; --------------------------------------------------------
+
+    ; ---- Detectar flanco descendente en RA0 (encender bomba) ----
+    MOVF    SENSORES_OLD, W
+    XORWF   SENSORES, W        ; W = bits que cambiaron
+    ANDLW   0x01               ; Solo RA0
+    BTFSC   STATUS, Z          ; ¿Cambió RA0?
+    GOTO    REVISA_RA4         ; No cambió ? revisar RA4
+
+    ; Sí cambió RA0: ver si fue de 1 a 0
+    BTFSS   SENSORES_OLD, 0    ; ¿Antes era 1?
+    GOTO    REVISA_RA4         ; No (era 0) ? no es descendente
+    BTFSC   SENSORES, 0        ; ¿Ahora es 0?
+    GOTO    REVISA_RA4         ; No (ahora 1) ? no es descendente
+
+    ; Flanco descendente en RA0: ENCENDER bomba
+    BSF     BOMBA_ESTADO, 0
+    GOTO    ACTUALIZA_LED_BOMBA
+
+REVISA_RA4
+    ; ---- Detectar flanco descendente en RA4 (apagar bomba) ----
+    MOVF    SENSORES_OLD, W
+    XORWF   SENSORES, W
+    ANDLW   0x10               ; Solo RA4 (bit4)
+    BTFSC   STATUS, Z          ; ¿Cambió RA4?
+    GOTO    ACTUALIZA_LED_BOMBA
+
+    ; Sí cambió RA4: ver si fue de 1 a 0
+    BTFSS   SENSORES_OLD, 4    ; ¿Antes era 1?
+    GOTO    ACTUALIZA_LED_BOMBA
+    BTFSC   SENSORES, 4        ; ¿Ahora es 0?
+    GOTO    ACTUALIZA_LED_BOMBA
+
+    ; Flanco descendente en RA4: APAGAR bomba
+    BCF     BOMBA_ESTADO, 0
+
+ACTUALIZA_LED_BOMBA
+    ; ========================================================
+    ; CONDICIÓN DE SEGURO: Si RA4 está activo (0), forzar apagado
+    ; ========================================================
+    BTFSC   SENSORES, 4        ; ¿RA4 = 0? (activo)
+    BCF     BOMBA_ESTADO, 0    ; Si está activo, apagar bomba
+
+    ; Reflejar estado de la bomba en LED verde (RB4)
+    BTFSS   BOMBA_ESTADO, 0    ; ¿Bomba encendida?
+    BCF     PORTB, 4           ; No ? apagar LED verde
+    BTFSC   BOMBA_ESTADO, 0
+    BSF     PORTB, 4           ; Sí ? encender LED verde
+
+    ; Guardar estado actual para la próxima comparación
+    MOVF    SENSORES, W
+    MOVWF   SENSORES_OLD
+
+    ; --------------------------------------------------------
+    ; Retardo antirrebote (aprox. 50 ms)
+    ; --------------------------------------------------------
+    CALL    RETARDO_50MS
+
+    GOTO    BUCLE
+
+; ============================================================
+; Subrutina de retardo ~50 ms (asumiendo cristal de 4 MHz)
+; ============================================================
+RETARDO_50MS
+    MOVLW   .100
+    MOVWF   CONTADOR2
+R2
+    MOVLW   .250
+    MOVWF   CONTADOR
+R1
+    DECFSZ  CONTADOR, F
+    GOTO    R1
+    DECFSZ  CONTADOR2, F
+    GOTO    R2
+    RETURN
+
+    END
